@@ -29,15 +29,22 @@ using ov::pass::operator|;
         auto weights_convert_reshape_m = wrap_type<ov::op::v1::Reshape>({weights_param_convert_m, any_input()});\
         auto decompressed_weights_m = convert_m | weights_convert_reshape_m;\
 \
-        auto sub_const_m = wrap_type<ov::op::v0::Constant>();\
+        auto sub_param_m = wrap_type<ov::op::v0::Parameter>(has_static_shape());\
+        auto sub_param_convert_m = ov::pass::pattern::optional<ov::op::v0::Convert>({sub_param_m});\
+        auto sub_param_reshape_m = wrap_type<ov::op::v1::Reshape>({sub_param_convert_m, any_input()}, has_static_shape());\
+        auto sub_const_m = wrap_type<ov::op::v0::Constant>() | sub_param_m | sub_param_reshape_m;\
         auto sub_convert_const_m = wrap_type<ov::op::v0::Convert>({sub_const_m});\
         auto sub_with_convert_m = wrap_type<ov::op::v1::Subtract>({decompressed_weights_m, sub_convert_const_m});\
         auto sub_no_convert_m = wrap_type<ov::op::v1::Subtract>({decompressed_weights_m, sub_const_m});\
         auto subtract_m = sub_with_convert_m | sub_no_convert_m;\
 \
-        auto mul_const_m = wrap_type<ov::op::v0::Constant>();\
-        auto mul_with_sub_m = wrap_type<ov::op::v1::Multiply>({subtract_m, mul_const_m});\
+        auto mul_param_m = wrap_type<ov::op::v0::Parameter>(has_static_shape());\
+        auto mul_param_convert_m = ov::pass::pattern::optional<ov::op::v0::Convert>({mul_param_m});\
+        auto mul_param_reshape_m = wrap_type<ov::op::v1::Reshape>({mul_param_convert_m, any_input()}, has_static_shape());\
+        auto mul_param_reshape_convert_m = ov::pass::pattern::optional<ov::op::v0::Convert>({mul_param_reshape_m});\
+        auto mul_const_m = wrap_type<ov::op::v0::Constant>() | mul_param_convert_m | mul_param_reshape_convert_m;\
         auto mul_const_convert_m = ov::pass::pattern::optional<ov::op::v0::Convert>(mul_const_m);\
+        auto mul_with_sub_m = wrap_type<ov::op::v1::Multiply>({subtract_m, mul_const_convert_m});\
         auto mul_no_sub_m = wrap_type<ov::op::v1::Multiply>({decompressed_weights_m, mul_const_convert_m});\
         auto mul_m = mul_with_sub_m | mul_no_sub_m;\
 \

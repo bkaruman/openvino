@@ -48,6 +48,8 @@ ConvertFullyConnectedToFullyConnectedCompressed::ConvertFullyConnectedToFullyCon
         }
         const bool has_transpose_before_reshape = pattern_map.count(transpose_before_reshape_m) != 0u;
         const bool has_transpose = pattern_map.count(transpose_m) != 0u;
+        const bool with_zero_point = pattern_map.count(subtract_m) > 0;
+        std::vector<std::shared_ptr<ov::Node>> result_nodes;
         auto scale_shape = pattern_map.at(mul_const_m).get_shape();
         bool sub_with_convert = pattern_map.count(sub_convert_const_m) > 0;
 
@@ -86,18 +88,17 @@ ConvertFullyConnectedToFullyConnectedCompressed::ConvertFullyConnectedToFullyCon
             weight_u8 = true;
         }
 
-        auto reshape_const = [has_transpose, grouped, is_weight_3d](std::shared_ptr<ov::Node> node) {
+        auto reshape_const = [has_transpose, grouped, is_weight_3d, &result_nodes](std::shared_ptr<ov::Node> node) -> std::shared_ptr<ov::Node> {
             auto constant = ov::as_type_ptr<ov::op::v0::Constant>(node);
-            OPENVINO_ASSERT(constant != nullptr);
-            ov::Shape current_shape = constant->get_shape();
+            ov::Shape current_shape = node->get_shape();
             if (current_shape.size() <= 2) {
-                return constant;
+                return node;
             }
 
             ov::Shape new_shape;
             if (current_shape.size() == 3) {
                 if (is_weight_3d) {
-                    return constant;
+                    return node;
                 }
                 new_shape = (has_transpose || !grouped) ? ov::Shape{current_shape[0] * current_shape[1], current_shape[2]}
                                                         : ov::Shape{current_shape[0], current_shape[1] * current_shape[2]};
@@ -110,29 +111,39 @@ ConvertFullyConnectedToFullyConnectedCompressed::ConvertFullyConnectedToFullyCon
             } else {
                 OPENVINO_THROW("Unexpected constant shape rank ", current_shape.size(), " with is_weight_3d=", is_weight_3d);
             }
-            auto new_constant = std::make_shared<ov::op::v0::Constant>(*constant, new_shape);
-
-            ov::copy_weightless_cache_attr(constant, new_constant);
-            return new_constant;
+            if (constant) {
+                auto new_constant = std::make_shared<ov::op::v0::Constant>(*constant, new_shape);
+                ov::copy_weightless_cache_attr(constant, new_constant);
+                result_nodes.push_back(new_constant);
+                return new_constant;
+            }
+            auto shape = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{new_shape.size()}, new_shape);
+            auto reshape = std::make_shared<ov::op::v1::Reshape>(node, shape, false);
+            result_nodes.push_back(shape);
+            result_nodes.push_back(reshape);
+            return reshape;
         };
 
         auto convert_zp_const = [&](std::shared_ptr<ov::Node> node) {
-            auto constant = ov::as_type_ptr<ov::op::v0::Constant>(node);
+            auto source = node;
+            while (ov::is_type<ov::op::v1::Reshape>(source) || ov::is_type<ov::op::v0::Convert>(source)) {
+                source = source->get_input_node_shared_ptr(0);
+            }
             std::shared_ptr<ov::Node> result = nullptr;
             // Convert ZP to u8 (or i8 for a scalar i4 ZP)
-            if (constant->get_element_type() == ov::element::u8) {
-                result = constant;
-            } else if (constant->get_element_type() == ov::element::u4 || constant->get_element_type() == ov::element::u3 ||
-                       constant->get_element_type() == ov::element::u2) {
+            if (node->get_element_type() == ov::element::u8) {
+                result = node;
+            } else if (source->get_element_type() == ov::element::u4 || source->get_element_type() == ov::element::u3 ||
+                       source->get_element_type() == ov::element::u2) {
                 result = std::make_shared<ov::op::v0::Convert>(node, ov::element::u8);
                 // Only unsigned ZP types can be converted to u8.
-            } else if (weight_u8 && sub_with_convert && !constant->get_element_type().is_signed()) {
+            } else if (weight_u8 && (sub_with_convert || source != node) && !source->get_element_type().is_signed()) {
                 result = std::make_shared<ov::op::v0::Convert>(node, ov::element::u8);
-            } else if (constant->get_element_type() == ov::element::i4 && ov::shape_size(constant->get_shape()) == 1) {
+            } else if (node->get_element_type() == ov::element::i4 && ov::shape_size(node->get_shape()) == 1) {
                 // oneDNN doesn't support sub-byte per-tensor (common) zero points, so a scalar i4 ZP is converted to i8.
                 result = std::make_shared<ov::op::v0::Convert>(node, ov::element::i8);
             } else {
-                result = constant;
+                result = node;
             }
 
             ov::copy_weightless_cache_attr(node, result);
@@ -140,12 +151,12 @@ ConvertFullyConnectedToFullyConnectedCompressed::ConvertFullyConnectedToFullyCon
         };
 
         const ov::Output<Node>& fc_input_a = fc->input(0).get_source_output();
-        const auto& scale = has_transpose_before_reshape
-                                ? pattern_map.at(mul_const_m).get_node_shared_ptr()
-                                : reshape_const(pattern_map.at(mul_const_m).get_node_shared_ptr());
+        auto scale_node = pattern_map.at(mul_const_m).get_node_shared_ptr();
+        if (!ov::is_type<ov::op::v0::Constant>(scale_node) && pattern_map.count(mul_const_convert_m))
+            scale_node = pattern_map.at(mul_const_convert_m).get_node_shared_ptr();
+        const auto& scale = has_transpose_before_reshape ? scale_node : reshape_const(scale_node);
         std::shared_ptr<ov::Node> optional_zero_point = nullptr;
 
-        const bool with_zero_point = pattern_map.count(subtract_m) > 0;
         if (with_zero_point) {
             const auto zero_point = has_transpose_before_reshape
                                         ? pattern_map.at(sub_const_m).get_node_shared_ptr()
@@ -165,15 +176,14 @@ ConvertFullyConnectedToFullyConnectedCompressed::ConvertFullyConnectedToFullyCon
         bool transpose_b_scale = fc->get_transpose_b();
         bool transpose_b_zp = fc->get_transpose_b();
         std::shared_ptr<ov::Node> fc_input_bias = pattern_map.at(bias_m).get_node_shared_ptr();
-        std::vector<std::shared_ptr<ov::Node>> result_nodes = {};
         if (with_zero_point && ov::is_type<ov::op::v0::Convert>(optional_zero_point)) {
             result_nodes.push_back(optional_zero_point);
         }
 
-        if (fc_input_b->get_output_partial_shape(0).size() != fc_input_scale->get_shape().size()) {
-            OPENVINO_ASSERT(!weights_are_constant);
-            ov::Shape weight_shape_final(fc_input_scale->get_shape().size(), 1);
-            for (size_t i = weight_shape.size() - 1, idx = fc_input_scale->get_shape().size() - 1;; --i) {
+        const size_t compressed_weight_rank = is_weight_3d ? 3 : 2;
+        if (!weights_are_constant && fc_input_b->get_output_partial_shape(0).size() != compressed_weight_rank) {
+            ov::Shape weight_shape_final(compressed_weight_rank, 1);
+            for (size_t i = weight_shape.size() - 1, idx = compressed_weight_rank - 1;; --i) {
                 if (weight_shape[i] > 1) {
                     weight_shape_final[idx--] = weight_shape[i];
                 }

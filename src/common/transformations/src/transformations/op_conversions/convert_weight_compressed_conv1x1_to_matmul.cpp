@@ -53,8 +53,16 @@ ov::pass::ConvertWeightCompressedConv1x1ToMatmul::ConvertWeightCompressedConv1x1
                                                             pattern::shape_matches("[?, ?, ?, 1, 1]"));
     auto weights_m = std::make_shared<ov::pass::pattern::op::Or>(OutputVector{weights_const_m, weights_param_m});
     auto weight_convert_m = ov::pass::pattern::wrap_type<ov::op::v0::Convert>({weights_m});
-    auto weights_scales_m = ov::pass::pattern::any_input();
-    auto weights_zp_m = ov::pass::pattern::any_input();
+    auto supported_qparam_shape = [](const ov::Output<ov::Node>& output) {
+        const auto& shape = output.get_partial_shape();
+        if (!shape.is_static())
+            return false;
+        const auto rank = shape.size();
+        return rank <= 2 || (rank == 4 && shape[2] == 1 && shape[3] == 1) ||
+               (rank == 5 && shape[3] == 1 && shape[4] == 1);
+    };
+    auto weights_scales_m = ov::pass::pattern::any_input(supported_qparam_shape);
+    auto weights_zp_m = ov::pass::pattern::any_input(supported_qparam_shape);
     auto weights_zp_convert_m = ov::pass::pattern::wrap_type<ov::op::v0::Convert>({weights_zp_m});
     auto weight_subtract_m =
         ov::pass::pattern::wrap_type<ov::op::v1::Subtract>({weight_convert_m, weights_zp_convert_m});
@@ -169,46 +177,47 @@ ov::pass::ConvertWeightCompressedConv1x1ToMatmul::ConvertWeightCompressedConv1x1
             }
         }
 
-        auto reshape_const_to_2d = [](std::shared_ptr<ov::Node> node) {
+        auto reshape_to_2d = [this](std::shared_ptr<ov::Node> node) -> std::shared_ptr<ov::Node> {
             auto constant = ov::as_type_ptr<ov::op::v0::Constant>(node);
-            OPENVINO_ASSERT(constant != nullptr);
-            ov::Shape current_shape = constant->get_shape();
+            const auto current_shape = node->get_shape();
             if (current_shape.size() == 2)
-                return constant;
+                return node;
 
+            ov::Shape new_shape;
             if (current_shape.size() <= 1) {
-                auto new_shape = ov::Shape{(current_shape.size() == 1) ? current_shape[0] : 1, 1};
-
-                auto new_constant = std::make_shared<ov::op::v0::Constant>(*constant, new_shape);
-
-                ov::copy_weightless_cache_attr(constant, new_constant);
-                return new_constant;
+                new_shape = ov::Shape{current_shape.empty() ? 1 : current_shape[0], 1};
             } else if (current_shape.size() == 4) {
                 OPENVINO_ASSERT(current_shape[2] == 1 && current_shape[3] == 1);
-
-                auto new_shape = ov::Shape{current_shape[0], current_shape[1]};
-
-                auto new_constant = std::make_shared<ov::op::v0::Constant>(*constant, new_shape);
-
-                ov::copy_weightless_cache_attr(constant, new_constant);
-                return new_constant;
+                new_shape = ov::Shape{current_shape[0], current_shape[1]};
             } else {
                 OPENVINO_ASSERT(current_shape.size() == 5);
                 OPENVINO_ASSERT(current_shape[3] == 1 && current_shape[4] == 1);
+                new_shape = ov::Shape{current_shape[0], current_shape[1], current_shape[2]};
+            }
 
-                auto new_shape = ov::Shape{current_shape[0], current_shape[1], current_shape[2]};
-
+            if (constant) {
                 auto new_constant = std::make_shared<ov::op::v0::Constant>(*constant, new_shape);
-
                 ov::copy_weightless_cache_attr(constant, new_constant);
+                ov::copy_runtime_info(constant, new_constant);
                 return new_constant;
             }
+
+            auto source = node->output(0);
+            if (auto reshape = ov::as_type_ptr<ov::op::v1::Reshape>(node)) {
+                if (ov::shape_size(current_shape) == ov::shape_size(new_shape))
+                    source = reshape->input_value(0);
+            }
+            auto shape_const = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{new_shape.size()}, new_shape);
+            auto reshape = std::make_shared<ov::op::v1::Reshape>(source, shape_const, false);
+            register_new_node(shape_const);
+            ov::copy_runtime_info(node, {shape_const, reshape});
+            return reshape;
         };
 
         // add reshape after weight
         std::shared_ptr<ov::op::v0::Convert> weight_squeezed_convert;
         if (ov::as_type_ptr<ov::op::v0::Constant>(weight)) {
-            auto Reshape_weight = reshape_const_to_2d(weight);
+            auto Reshape_weight = reshape_to_2d(weight);
             MatcherPass::register_new_node(Reshape_weight);
             Reshape_weight->set_friendly_name(weight->get_friendly_name() + "_Reshape_weight");
             weight_squeezed_convert =
@@ -235,7 +244,7 @@ ov::pass::ConvertWeightCompressedConv1x1ToMatmul::ConvertWeightCompressedConv1x1
         ov::disable_constant_folding(weight_squeezed_convert);
 
         // add reshape after scales
-        auto Reshape_scale = reshape_const_to_2d(scale);
+        auto Reshape_scale = reshape_to_2d(scale);
         MatcherPass::register_new_node(Reshape_scale);
         Reshape_scale->set_friendly_name(scale->get_friendly_name() + "_Reshape_scale");
         ov::copy_runtime_info(scale, Reshape_scale);
@@ -243,7 +252,7 @@ ov::pass::ConvertWeightCompressedConv1x1ToMatmul::ConvertWeightCompressedConv1x1
         auto scaled_weight = weight_mult->clone_with_new_inputs({weight_squeezed_convert, Reshape_scale});
         if (zp) {
             // add reshape after zero points
-            auto Reshape_zp = reshape_const_to_2d(zp);
+            auto Reshape_zp = reshape_to_2d(zp);
             MatcherPass::register_new_node(Reshape_zp);
             Reshape_zp->set_friendly_name(zp->get_friendly_name() + "_Reshape_zp");
             auto weights_zp_convert =

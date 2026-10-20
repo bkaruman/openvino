@@ -124,12 +124,19 @@ struct FullyConnectedImplementationManager : public ImplementationManager {
         std::vector<format::type> out_fmts(node.get_outputs_count(), format::any);
 
         size_t out_rank = node.get_output_layout().get_rank();
+        const auto& fc_prim = node.as<fully_connected>().get_primitive();
+        const size_t scale_idx = fc_prim->bias.is_valid() ? 3 : 2;
+        const size_t zp_idx = scale_idx + (fc_prim->decompression_scale.is_valid() ? 1 : 0);
         for (size_t idx = 0 ; idx < node.get_dependencies().size() ; idx++) {
             if (node.get_dependency(idx).is_constant()) {
                 continue;
             }
 
             auto target_format = format::get_default_format(out_rank);
+            if ((fc_prim->decompression_scale.is_valid() && idx == scale_idx) ||
+                (fc_prim->decompression_zero_point.is_valid() && idx == zp_idx)) {
+                target_format = node.get_input_layout(idx).format;
+            }
 
             in_fmts[idx] = target_format;
         }
