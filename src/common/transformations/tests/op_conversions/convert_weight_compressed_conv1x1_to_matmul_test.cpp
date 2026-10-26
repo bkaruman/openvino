@@ -18,6 +18,7 @@
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/shape_of.hpp"
+#include "openvino/op/split.hpp"
 #include "openvino/op/subtract.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/opsets/opset1_decl.hpp"
@@ -43,7 +44,27 @@ struct Conv1x1ToMatmulTestParams {
     bool with_act_new_reshape;
     bool with_batched_input;
     std::string activation_op_type;
+    bool with_param_scale = false;
+    bool with_param_zp = false;
+    bool reshape_qparams = false;
 };
+
+std::shared_ptr<ov::Node> make_qparam(const ov::element::Type& type,
+                                    const ov::Shape& original_shape,
+                                    const ov::Shape& target_shape,
+                                    bool runtime,
+                                    bool flattened,
+                                    ov::ParameterVector& parameters) {
+    if (!runtime)
+        return ov::opset1::Constant::create(type, target_shape, {1});
+    const auto input_shape = flattened ? ov::Shape{ov::shape_size(original_shape)} : original_shape;
+    auto parameter = std::make_shared<ov::opset1::Parameter>(type, input_shape);
+    parameters.push_back(parameter);
+    if (input_shape == target_shape)
+        return parameter;
+    auto shape = ov::opset1::Constant::create(ov::element::i32, ov::Shape{target_shape.size()}, target_shape);
+    return std::make_shared<ov::opset1::Reshape>(parameter, shape, false);
+}
 
 std::shared_ptr<ov::Model> gen_model(const Conv1x1ToMatmulTestParams& p) {
     size_t input_batch = p.with_batched_input ? 4 : 1;
@@ -87,18 +108,15 @@ std::shared_ptr<ov::Model> gen_model(const Conv1x1ToMatmulTestParams& p) {
     std::shared_ptr<ov::Node> current_node = weights_convert;
 
     if (p.with_zp) {
-        auto zp_const =
-            ov::opset1::Constant::create(ov::element::i4,
-                                         p.with_group_quant ? ov::Shape{15, 5, 1, 1, 1} : ov::Shape{15, 1, 1, 1},
-                                         {1});
+        const auto shape = p.with_group_quant ? ov::Shape{15, 5, 1, 1, 1} : ov::Shape{15, 1, 1, 1};
+        auto zp_const = make_qparam(ov::element::i4, shape, shape, p.with_param_zp, p.reshape_qparams, params);
         auto zp_convert = std::make_shared<ov::op::v0::Convert>(zp_const, ov::element::f16);
         current_node = std::make_shared<ov::opset1::Subtract>(weights_convert, zp_convert);
     }
 
-    auto scale_const =
-        ov::opset1::Constant::create(ov::element::f16,
-                                     p.with_group_quant ? ov::Shape{15, 5, 1, 1, 1} : ov::Shape{15, 1, 1, 1},
-                                     {1});
+    const auto scale_shape = p.with_group_quant ? ov::Shape{15, 5, 1, 1, 1} : ov::Shape{15, 1, 1, 1};
+    auto scale_const = make_qparam(ov::element::f16, scale_shape, scale_shape,
+                                  p.with_param_scale, p.reshape_qparams, params);
     std::shared_ptr<ov::Node> mul = std::make_shared<ov::opset1::Multiply>(current_node, scale_const);
 
     if (p.with_group_quant) {
@@ -169,16 +187,18 @@ std::shared_ptr<ov::Model> gen_model_ref(const Conv1x1ToMatmulTestParams& p) {
     std::shared_ptr<ov::Node> current_node = weights_convert;
 
     if (p.with_zp) {
-        auto zp_const = ov::opset1::Constant::create(ov::element::i4,
-                                                     p.with_group_quant ? ov::Shape{15, 5, 1} : ov::Shape{15, 1},
-                                                     {1});
+        const auto shape = p.with_group_quant ? ov::Shape{15, 5, 1, 1, 1} : ov::Shape{15, 1, 1, 1};
+        const auto target_shape = p.with_group_quant ? ov::Shape{15, 5, 1} : ov::Shape{15, 1};
+        auto zp_const = make_qparam(ov::element::i4, shape, target_shape,
+                                   p.with_param_zp, p.reshape_qparams, params);
         auto zp_convert = std::make_shared<ov::op::v0::Convert>(zp_const, ov::element::f16);
         current_node = std::make_shared<ov::opset1::Subtract>(weights_convert, zp_convert);
     }
 
-    auto scale_const = ov::opset1::Constant::create(ov::element::f16,
-                                                    p.with_group_quant ? ov::Shape{15, 5, 1} : ov::Shape{15, 1},
-                                                    {1});
+    const auto scale_shape = p.with_group_quant ? ov::Shape{15, 5, 1, 1, 1} : ov::Shape{15, 1, 1, 1};
+    const auto target_scale_shape = p.with_group_quant ? ov::Shape{15, 5, 1} : ov::Shape{15, 1};
+    auto scale_const = make_qparam(ov::element::f16, scale_shape, target_scale_shape,
+                                  p.with_param_scale, p.reshape_qparams, params);
     std::shared_ptr<ov::Node> mul = std::make_shared<ov::opset1::Multiply>(current_node, scale_const);
 
     if (p.with_group_quant) {
@@ -296,6 +316,162 @@ INSTANTIATE_TEST_SUITE_P(TransformationTests,
                                                               "None")),
                          ConvertWeightCompressedConv1x1ToMatmulTest::get_test_case_name);
 
+class ConvertWeightCompressedConv1x1RuntimeInputs
+    : public TransformationTestsF,
+      public WithParamInterface<std::tuple<bool, bool, bool, bool>> {
+public:
+    static std::string getTestCaseName(const testing::TestParamInfo<ParamType>& info) {
+        const auto& [grouped, runtime_scale, runtime_zp, reshape_qparams] = info.param;
+        std::string name = grouped ? "Grouped" : "Ungrouped";
+        name += runtime_scale ? "_RuntimeScale" : "_ConstantScale";
+        name += runtime_zp ? "_RuntimeZeroPoint" : "_ConstantZeroPoint";
+        name += reshape_qparams ? "_FlattenedParameters" : "_ShapedParameters";
+        return name;
+    }
+
+protected:
+    void SetUp() override {
+        TransformationTestsF::SetUp();
+        const auto [grouped, runtime_scale, runtime_zp, reshape_qparams] = GetParam();
+        Conv1x1ToMatmulTestParams params{grouped, true, false, false, true, false, false, "Transpose"};
+        params.with_param_scale = runtime_scale;
+        params.with_param_zp = runtime_zp;
+        params.reshape_qparams = reshape_qparams;
+        model = gen_model(params);
+        model_ref = gen_model_ref(params);
+        comparator.enable(FunctionsComparator::ATTRIBUTES);
+        comparator.enable(FunctionsComparator::CONST_VALUES);
+        manager.register_pass<ov::pass::ConvertWeightCompressedConv1x1ToMatmul>();
+    }
+};
+
+TEST_P(ConvertWeightCompressedConv1x1RuntimeInputs, ComposeDecompressionReshapes) {}
+
+INSTANTIATE_TEST_SUITE_P(RuntimeDecompression,
+                         ConvertWeightCompressedConv1x1RuntimeInputs,
+                         Combine(Bool(), Bool(), Bool(), Bool()),
+                         ConvertWeightCompressedConv1x1RuntimeInputs::getTestCaseName);
+
+class ConvertWeightCompressedConv1x1MultiOutputInputs : public TransformationTestsF,
+                                                       public WithParamInterface<bool> {
+public:
+    static std::string getTestCaseName(const testing::TestParamInfo<bool>& info) {
+        return info.param ? "RuntimeZeroPoint" : "RuntimeScale";
+    }
+
+protected:
+    void SetUp() override {
+        TransformationTestsF::SetUp();
+        Conv1x1ToMatmulTestParams params{false, true, false, false, false, false, false, "Transpose"};
+        params.with_param_scale = !GetParam();
+        params.with_param_zp = GetParam();
+        model = gen_model(params);
+        model_ref = gen_model_ref(params);
+        for (const auto& graph : {model, model_ref}) {
+            const auto& parameter = graph->get_parameters().back();
+            const auto consumers = parameter->output(0).get_target_inputs();
+            parameter->set_partial_shape(ov::Shape{30, 1, 1, 1});
+            parameter->validate_and_infer_types();
+            auto axis = ov::opset1::Constant::create(ov::element::i64, ov::Shape{}, {0});
+            auto split = std::make_shared<ov::opset1::Split>(parameter, axis, 2);
+            for (auto consumer : consumers)
+                consumer.replace_source_output(split->output(1));
+            graph->validate_nodes_and_infer_types();
+        }
+        comparator.enable(FunctionsComparator::ATTRIBUTES);
+        comparator.enable(FunctionsComparator::CONST_VALUES);
+        manager.register_pass<ov::pass::ConvertWeightCompressedConv1x1ToMatmul>();
+    }
+};
+
+TEST_P(ConvertWeightCompressedConv1x1MultiOutputInputs, PreserveNonzeroOutputPort) {}
+
+INSTANTIATE_TEST_SUITE_P(RuntimeDecompression,
+                         ConvertWeightCompressedConv1x1MultiOutputInputs,
+                         Bool(),
+                         ConvertWeightCompressedConv1x1MultiOutputInputs::getTestCaseName);
+
+class ConvertWeightCompressedConv1x1BroadcastInputs
+    : public TransformationTestsF,
+      public WithParamInterface<std::tuple<bool, ov::Shape>> {
+public:
+    static std::string getTestCaseName(const testing::TestParamInfo<ParamType>& info) {
+        const auto& [zero_point, shape] = info.param;
+        std::string name = zero_point ? "RuntimeZeroPoint" : "RuntimeScale";
+        if (shape.empty())
+            return name + "_Scalar";
+        if (shape.size() == 1)
+            return name + (shape[0] == 1 ? "_SingletonVector" : "_SpatialVectorNotConverted");
+        return name + (ov::shape_size(shape) == 1 ? "_SingletonMatrix" : "_SpatialMatrixNotConverted");
+    }
+
+protected:
+    void SetUp() override {
+        TransformationTestsF::SetUp();
+        comparator.enable(FunctionsComparator::ATTRIBUTES);
+        comparator.enable(FunctionsComparator::CONST_VALUES);
+        const auto& [zero_point, shape] = GetParam();
+        auto input = std::make_shared<ov::opset1::Parameter>(ov::element::f16, ov::Shape{1, 1, 3, 16});
+        auto parameter = std::make_shared<ov::opset1::Parameter>(
+            zero_point ? ov::element::u8 : ov::element::f16, shape);
+        parameter->set_friendly_name("quantization_parameter");
+        parameter->output(0).get_tensor().set_names({"quantization_parameter_tensor"});
+        const ov::ParameterVector parameters{input, parameter};
+        auto input_order = ov::opset1::Constant::create(ov::element::i32, ov::Shape{4}, {0, 3, 1, 2});
+        auto activation = std::make_shared<ov::opset1::Transpose>(input, input_order);
+        auto weights = ov::opset1::Constant::create(ov::element::u8, ov::Shape{2, 16, 1, 1}, {1});
+        auto weights_float = std::make_shared<ov::opset1::Convert>(weights, ov::element::f16);
+        auto scale = ov::opset1::Constant::create(ov::element::f16, ov::Shape{}, {1});
+        std::shared_ptr<ov::Node> decompressed = weights_float;
+        if (zero_point) {
+            auto zp_float = std::make_shared<ov::opset1::Convert>(parameter, ov::element::f16);
+            decompressed = std::make_shared<ov::opset1::Subtract>(decompressed, zp_float);
+        }
+        auto multiply = std::make_shared<ov::opset1::Multiply>(
+            decompressed, zero_point ? std::shared_ptr<ov::Node>(scale) : parameter);
+        auto conv = std::make_shared<ov::opset1::Convolution>(activation, multiply, ov::Strides{1, 1},
+                                                           ov::CoordinateDiff{0, 0}, ov::CoordinateDiff{0, 0},
+                                                           ov::Strides{1, 1});
+        auto output_order = ov::opset1::Constant::create(ov::element::i32, ov::Shape{4}, {0, 2, 3, 1});
+        auto output = std::make_shared<ov::opset1::Transpose>(conv, output_order);
+        model = std::make_shared<ov::Model>(ov::OutputVector{output}, parameters);
+        if (ov::shape_size(shape) == 1) {
+            auto weights_2d = ov::opset1::Constant::create(ov::element::u8, ov::Shape{2, 16}, {1});
+            auto converted_weights = std::make_shared<ov::opset1::Convert>(weights_2d, ov::element::f16);
+            auto parameter_shape = ov::opset1::Constant::create(ov::element::i32, ov::Shape{2}, {1, 1});
+            std::shared_ptr<ov::Node> parameter_2d = parameter;
+            if (shape.size() != 2)
+                parameter_2d = std::make_shared<ov::opset1::Reshape>(parameter, parameter_shape, false);
+            std::shared_ptr<ov::Node> expected_weights = converted_weights;
+            if (zero_point) {
+                auto zp_float = std::make_shared<ov::opset1::Convert>(parameter_2d, ov::element::f16);
+                expected_weights = std::make_shared<ov::opset1::Subtract>(expected_weights, zp_float);
+            }
+            auto scale_2d = ov::opset1::Constant::create(ov::element::f16, ov::Shape{1, 1}, {1});
+            auto expected_multiply = std::make_shared<ov::opset1::Multiply>(
+                expected_weights, zero_point ? std::shared_ptr<ov::Node>(scale_2d) : parameter_2d);
+            auto matmul = std::make_shared<ov::opset1::MatMul>(input, expected_multiply, false, true);
+            model_ref = std::make_shared<ov::Model>(ov::OutputVector{matmul}, parameters);
+        }
+        manager.register_pass<ov::pass::ConvertWeightCompressedConv1x1ToMatmul>();
+    }
+
+    void TearDown() override {
+        TransformationTestsF::TearDown();
+        const auto& parameter = model->get_parameters().back();
+        EXPECT_EQ(parameter->get_friendly_name(), "quantization_parameter");
+        EXPECT_EQ(parameter->output(0).get_names().count("quantization_parameter_tensor"), 1u);
+    }
+};
+
+TEST_P(ConvertWeightCompressedConv1x1BroadcastInputs, PreserveBroadcastSemantics) {}
+
+INSTANTIATE_TEST_SUITE_P(RuntimeDecompression,
+                         ConvertWeightCompressedConv1x1BroadcastInputs,
+                         Combine(Bool(), Values(ov::Shape{}, ov::Shape{1}, ov::Shape{2},
+                                                ov::Shape{1, 1}, ov::Shape{1, 2})),
+                         ConvertWeightCompressedConv1x1BroadcastInputs::getTestCaseName);
+
 // Checked blocked cases
 class ConvertWeightCompressedConv1x1ToMatmulTest_Blocked : public TransformationTestsF {
 public:
@@ -303,6 +479,34 @@ public:
         manager.register_pass<ov::pass::ConvertWeightCompressedConv1x1ToMatmul>();
     }
 };
+
+TEST_F(ConvertWeightCompressedConv1x1ToMatmulTest_Blocked, DynamicRuntimeScale) {
+    Conv1x1ToMatmulTestParams params{false, true, false, false, true, false, false, "Transpose"};
+    params.with_param_scale = true;
+    model = gen_model(params);
+    model->get_parameters().back()->set_partial_shape(ov::PartialShape{-1, 1, 1, 1});
+    model->validate_nodes_and_infer_types();
+}
+
+TEST_F(ConvertWeightCompressedConv1x1ToMatmulTest_Blocked, DynamicRuntimeZeroPoint) {
+    Conv1x1ToMatmulTestParams params{false, true, false, false, true, false, false, "Transpose"};
+    params.with_param_zp = true;
+    model = gen_model(params);
+    model->get_parameters().back()->set_partial_shape(ov::PartialShape{-1, 1, 1, 1});
+    model->validate_nodes_and_infer_types();
+}
+
+TEST_F(ConvertWeightCompressedConv1x1ToMatmulTest_Blocked, NonSingletonSpatialRuntimeScale) {
+    Conv1x1ToMatmulTestParams params{false, true, false, false, true, false, false, "Transpose"};
+    params.with_param_scale = true;
+    model = gen_model(params);
+    model->get_parameters().back()->set_partial_shape(ov::Shape{15, 1, 1, 2});
+    for (const auto& node : model->get_ops()) {
+        if (auto conv = ov::as_type_ptr<ov::op::v1::Convolution>(node))
+            conv->set_pads_end(ov::CoordinateDiff{0, 1});
+    }
+    model->validate_nodes_and_infer_types();
+}
 
 TEST_F(ConvertWeightCompressedConv1x1ToMatmulTest_Blocked, conv3x3) {
     auto CreateConv3x3 = [&]() {

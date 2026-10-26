@@ -35,6 +35,56 @@
 using namespace testing;
 using namespace ov::intel_gpu;
 
+enum class DynamicDecompressionInput { Weights, Scale, ZeroPoint };
+
+class ConvertMatMulToFCDynamicDecompression : public TransformationTestsF,
+                                            public WithParamInterface<DynamicDecompressionInput> {
+public:
+    static std::string getTestCaseName(const testing::TestParamInfo<DynamicDecompressionInput>& info) {
+        switch (info.param) {
+        case DynamicDecompressionInput::Weights: return "DynamicWeights";
+        case DynamicDecompressionInput::Scale: return "DynamicScale";
+        case DynamicDecompressionInput::ZeroPoint: return "DynamicZeroPoint";
+        }
+        return "UnknownInput";
+    }
+
+protected:
+    void SetUp() override {
+        TransformationTestsF::SetUp();
+        auto input = std::make_shared<ov::opset1::Parameter>(ov::element::f16, ov::Shape{1, 32});
+        auto weights = std::make_shared<ov::opset1::Parameter>(
+            ov::element::u4, GetParam() == DynamicDecompressionInput::Weights ? ov::PartialShape{-1, 32}
+                                                                           : ov::PartialShape{1, 32});
+        auto weights_float = std::make_shared<ov::opset1::Convert>(weights, ov::element::f16);
+        auto scale = std::make_shared<ov::opset1::Parameter>(
+            ov::element::f16, GetParam() == DynamicDecompressionInput::Scale ? ov::PartialShape{-1, 1}
+                                                                          : ov::PartialShape{1, 1});
+        ov::ParameterVector parameters{input, weights, scale};
+        std::shared_ptr<ov::Node> decompressed = weights_float;
+        if (GetParam() == DynamicDecompressionInput::ZeroPoint) {
+            auto zp = std::make_shared<ov::opset1::Parameter>(ov::element::u8, ov::PartialShape{-1, 1});
+            parameters.push_back(zp);
+            auto zp_float = std::make_shared<ov::opset1::Convert>(zp, ov::element::f16);
+            decompressed = std::make_shared<ov::opset1::Subtract>(decompressed, zp_float);
+        }
+        auto multiply = std::make_shared<ov::opset1::Multiply>(decompressed, scale);
+        auto matmul = std::make_shared<ov::opset1::MatMul>(input, multiply, false, true);
+        model = std::make_shared<ov::Model>(ov::OutputVector{matmul}, parameters);
+        manager.register_pass<ConvertMatMulToFullyConnected>(true);
+        manager.register_pass<ConvertFullyConnectedToFullyConnectedCompressed>();
+    }
+};
+
+TEST_P(ConvertMatMulToFCDynamicDecompression, NotConverted) {}
+
+INSTANTIATE_TEST_SUITE_P(RuntimeDecompression,
+                         ConvertMatMulToFCDynamicDecompression,
+                         Values(DynamicDecompressionInput::Weights,
+                                DynamicDecompressionInput::Scale,
+                                DynamicDecompressionInput::ZeroPoint),
+                         ConvertMatMulToFCDynamicDecompression::getTestCaseName);
+
 TEST_F(TransformationTestsF, ConvertMatMulToFullyConnectedTest1) {
     {
         auto input1 = std::make_shared<ov::opset1::Parameter>(ov::element::f32, ov::Shape{ 3, 2, 2 });

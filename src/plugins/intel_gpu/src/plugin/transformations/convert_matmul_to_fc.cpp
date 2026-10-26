@@ -131,7 +131,9 @@ ConvertMatMulToFullyConnected::ConvertMatMulToFullyConnected(bool supports_immad
 
         auto shape_a = fc_input_a.get_partial_shape();
         auto shape_b = fc_input_b.get_partial_shape();
-        OPENVINO_ASSERT(shape_b.is_static());
+        if (!shape_b.is_static()) {
+            return false;
+        }
 
         auto rank_a = shape_a.rank().get_length();
         auto rank_b = shape_b.rank().get_length();

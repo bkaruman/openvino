@@ -23,6 +23,15 @@ struct fully_connected_onednn : typed_primitive_onednn_impl<fully_connected> {
     static constexpr int COMMON = 0;
     static constexpr int PER_OC = 2;
 
+    static int64_t get_decompression_groups(const layout& param_layout, bool transpose_b_param, size_t weights_rank, int64_t ifm) {
+        const auto groups = param_layout.count() == 1
+                                ? 1
+                                : param_layout.get_dim(get_ifm_dim_idx(param_layout, transpose_b_param, weights_rank));
+        OPENVINO_ASSERT(groups > 0 && ifm % groups == 0,
+                        "[GPU] Decompression group count should evenly divide IFM dimension.");
+        return groups;
+    }
+
     DECLARE_OBJECT_TYPE_SERIALIZATION(cldnn::onednn::fully_connected_onednn)
 
 private:
@@ -264,10 +273,8 @@ public:
         const kernel_impl_params* impl_params = reinterpret_cast<kernel_impl_params*>(ib.getKernelImplParams());
         auto prim = impl_params->typed_desc<fully_connected>();
         auto weights_layout = impl_params->get_input_layout(1);
-        const auto& weight_shape = weights_layout.get_partial_shape();
-        auto weight_rank = std::count_if(weight_shape.begin(), weight_shape.end(),
-            [](ov::Dimension d) { return d.get_length() > 1; });
-        weight_rank = std::max(static_cast<int64_t>(2), weight_rank);
+        const auto weight_rank = get_compressed_weights_rank(weights_layout);
+        const auto ifm = weights_layout.get_dim(prim->weights_transposed ? weight_rank - 1 : weight_rank - 2);
 
         auto shift_size = std::max<size_t>(prim->input_size - 2, 0);
         const auto& arg = impl_params->get_program().get_node(impl_params->desc->id).as<fully_connected>();
@@ -282,10 +289,10 @@ public:
 
             auto decompression_scale_idx = ++idx;
             auto scale_layout = arg.get_dependency(decompression_scale_idx).get_output_layout();
-            const auto ngroups = scale_layout.get_dim(get_ifm_dim_idx(scale_layout, transpose_b_scale, weight_rank));
+            const auto ngroups = get_decompression_groups(scale_layout, transpose_b_scale, weight_rank, ifm);
             if (scale_layout.count() == 1) {
                 _attrs->set_scales(DNNL_ARG_WEIGHTS, COMMON, dnnl::memory::dims{}, _ds_data_type);
-            } else if (ngroups == 1) {
+            } else if (ngroups == 1 && weight_rank <= 2) {
                 _attrs->set_scales(DNNL_ARG_WEIGHTS, per_oc, dnnl::memory::dims{}, _ds_data_type);
             } else {
                 _attrs->set_scales(DNNL_ARG_WEIGHTS, grouped, {_ds_group_size, 1}, _ds_data_type);
@@ -302,11 +309,15 @@ public:
                 if (dzp_layout.count() == 1) {
                     _attrs->set_zero_points(DNNL_ARG_WEIGHTS, COMMON, dnnl::memory::dims{}, _dzp_data_type);
                 } else {
-                    auto ngroups = dzp_layout.get_dim(get_ifm_dim_idx(dzp_layout, transpose_b_zp, weight_rank));
-                    if (ngroups == 1) {
+                    const auto ngroups = get_decompression_groups(dzp_layout, transpose_b_zp, weight_rank, ifm);
+                    const auto& dzp_shape = dzp_layout.get_partial_shape();
+                    const auto dzp_rank = std::count_if(dzp_shape.begin(), dzp_shape.end(), [](ov::Dimension d) {
+                        return d.get_length() > 1;
+                    });
+                    if (ngroups == 1 && dzp_rank <= 2) {
                         _attrs->set_zero_points(DNNL_ARG_WEIGHTS, per_oc, dnnl::memory::dims{}, _dzp_data_type);
                     } else {
-                        _attrs->set_zero_points(DNNL_ARG_WEIGHTS, grouped, {_ds_group_size, 1}, _dzp_data_type);
+                        _attrs->set_zero_points(DNNL_ARG_WEIGHTS, grouped, {ifm / ngroups, 1}, _dzp_data_type);
                     }
                 }
             }
@@ -373,6 +384,7 @@ public:
             auto weights_layout = impl_params.get_input_layout(1);
             const auto weight_rank = get_compressed_weights_rank(weights_layout);
             OPENVINO_ASSERT(weight_rank <= 3, "Currently only weights with equal to or less than 3D is supported");
+            const auto ifm = weights_layout.get_dim(prim->weights_transposed ? weight_rank - 1 : weight_rank - 2);
             auto shift_size = std::max<size_t>(prim->input_size - 2, 0);
             int per_oc = PER_OC << shift_size;
             int grouped = (1 << prim->input_size) - 1;
@@ -382,7 +394,7 @@ public:
                 auto scale_layout = arg.get_dependency(decompression_scale_idx).get_output_layout();
                 ds_data_type = convert_data_type(scale_layout.data_type);
                 const auto groups = get_scale_groups(weights_layout, scale_layout, prim->weights_transposed, prim->transpose_b_scale);
-                const auto ngroups = groups.first;
+                const auto ngroups = get_decompression_groups(scale_layout, prim->transpose_b_scale, weight_rank, ifm);
                 group_size = static_cast<int>(groups.second);
                 OPENVINO_ASSERT(is_supported_scale_group(ngroups, group_size),
                     "[GPU] group_size should be aligned to 16 if it is not a single scale group or the group_size is not one.");
@@ -411,12 +423,12 @@ public:
                     auto dzp_rank = std::count_if(dzp_shape.begin(), dzp_shape.end(), [](ov::Dimension d) { return d.get_length() > 1; });
                     dzp_rank = std::max(static_cast<int64_t>(2), dzp_rank);
 
-                    auto ngroups = dzp_layout.get_dim(get_ifm_dim_idx(dzp_layout, prim->transpose_b_zp, weight_rank));
+                    const auto ngroups = get_decompression_groups(dzp_layout, prim->transpose_b_zp, weight_rank, ifm);
                     if (ngroups == 1 && dzp_rank <= 2) {
                         attr->set_zero_points(DNNL_ARG_WEIGHTS, per_oc, dnnl::memory::dims{}, dzp_data_type);
                     } else {
                         // should use {K, 1} for the group size + per tensor mask for 3d
-                        attr->set_zero_points(DNNL_ARG_WEIGHTS, grouped, {group_size, 1}, dzp_data_type);
+                        attr->set_zero_points(DNNL_ARG_WEIGHTS, grouped, {ifm / ngroups, 1}, dzp_data_type);
                     }
                 }
             }

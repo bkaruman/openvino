@@ -22,9 +22,209 @@
 #include "fully_connected_inst.h"
 
 #include <cmath>
+#include <tuple>
+
+#ifdef ENABLE_ONEDNN_FOR_GPU
+#include "graph/impls/onednn/primitive_onednn_base.h"
+#endif
 
 using namespace cldnn;
 using namespace ::tests;
+
+#ifdef ENABLE_ONEDNN_FOR_GPU
+class fully_connected_runtime_decompression
+    : public testing::TestWithParam<std::tuple<bool, bool, bool, bool, bool, bool, bool>> {
+public:
+    static std::string getTestCaseName(const testing::TestParamInfo<ParamType>& info) {
+        const auto& [weights_transposed, scale_transposed, zp_transposed, runtime_scale, runtime_zp, grouped_zp, cached] = info.param;
+        std::string name = weights_transposed ? "WeightsNK" : "WeightsKN";
+        name += scale_transposed ? "_ScaleNG" : "_ScaleGN";
+        name += zp_transposed ? "_ZeroPointNG" : "_ZeroPointGN";
+        name += runtime_scale ? "_RuntimeScale" : "_ConstantScale";
+        name += runtime_zp ? "_RuntimeZeroPoint" : "_ConstantZeroPoint";
+        name += grouped_zp ? "_GroupedZeroPoint" : "_PerChannelZeroPoint";
+        name += cached ? "_Cached" : "_Fresh";
+        return name;
+    }
+};
+
+TEST_P(fully_connected_runtime_decompression, independent_orientations_and_cache) {
+    const auto [weights_transposed, scale_transposed, zp_transposed, runtime_scale, runtime_zp, grouped_zp, cached] = GetParam();
+    auto& engine = get_test_engine();
+    if (!engine.get_device_info().supports_immad || !engine.get_device_info().supports_fp16)
+        GTEST_SKIP() << "Requires an Intel GPU with XMX and FP16 support.";
+
+    // Non-square parameter matrices and nonsymmetric values make swapped axes observable.
+    constexpr int64_t n = 3;
+    constexpr int64_t k = 32;
+    constexpr int64_t groups = 2;
+    const int64_t zp_groups = grouped_zp ? groups : 1;
+    const auto weights_shape = weights_transposed ? ov::PartialShape{n, k} : ov::PartialShape{k, n};
+    const auto scale_shape = scale_transposed ? ov::PartialShape{n, groups} : ov::PartialShape{groups, n};
+    const auto zp_shape = zp_transposed ? ov::PartialShape{n, zp_groups} : ov::PartialShape{zp_groups, n};
+    auto input = engine.allocate_memory({{1, 2, k}, data_types::f16, format::bfyx});
+    auto weights = engine.allocate_memory({weights_shape, data_types::u8, format::bfyx});
+    auto scale = engine.allocate_memory({scale_shape, data_types::f16, format::bfyx});
+    auto zp = engine.allocate_memory({zp_shape, data_types::u8, format::bfyx});
+    std::vector<ov::float16> input_values(2 * k);
+    for (int64_t row = 0; row < 2; ++row) {
+        for (int64_t ic = 0; ic < k; ++ic)
+            input_values[row * k + ic] = ov::float16(static_cast<float>(1 + (row + ic) % 2));
+    }
+    set_values<ov::float16>(input, input_values);
+    std::vector<uint8_t> weight_values(n * k);
+    for (int64_t oc = 0; oc < n; ++oc) {
+        for (int64_t ic = 0; ic < k; ++ic)
+            weight_values[weights_transposed ? oc * k + ic : ic * n + oc] = static_cast<uint8_t>(4 + oc + ic % 3);
+    }
+    set_values<uint8_t>(weights, weight_values);
+
+    auto set_parameters = [&](int iteration) {
+        std::vector<ov::float16> scales(n * groups);
+        std::vector<uint8_t> zero_points(n * zp_groups);
+        for (int64_t oc = 0; oc < n; ++oc) {
+            for (int64_t g = 0; g < groups; ++g)
+                scales[scale_transposed ? oc * groups + g : g * n + oc] =
+                    ov::float16(static_cast<float>(1 + 3 * oc + g + (runtime_scale ? iteration : 0)));
+            for (int64_t g = 0; g < zp_groups; ++g)
+                zero_points[zp_transposed ? oc * zp_groups + g : g * n + oc] =
+                    static_cast<uint8_t>(2 * oc + g + (runtime_zp ? iteration : 0));
+        }
+        if (iteration == 0 || runtime_scale)
+            set_values<ov::float16>(scale, scales);
+        if (iteration == 0 || runtime_zp)
+            set_values<uint8_t>(zp, zero_points);
+    };
+    set_parameters(0);
+    topology topology(input_layout("input", input->get_layout()), data("weights", weights));
+    if (runtime_scale)
+        topology.add(input_layout("scale", scale->get_layout()));
+    else
+        topology.add(data("scale", scale));
+    if (runtime_zp)
+        topology.add(input_layout("zp", zp->get_layout()));
+    else
+        topology.add(data("zp", zp));
+    topology.add(fully_connected("fc", input_info("input"), "weights", "", "scale", "zp",
+                                 data_types::f16, 3, 2, weights_transposed, scale_transposed, zp_transposed));
+    auto config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    config.set_property(ov::intel_gpu::force_implementations(
+        ov::intel_gpu::ImplForcingMap{{"fc", {format::bfyx, "", impl_types::onednn}}}));
+    auto network = get_network(engine, topology, config, get_test_stream_ptr(), cached);
+    network->set_input_data("input", input);
+    for (int iteration = 0; iteration < 2; ++iteration) {
+        set_parameters(iteration);
+        if (runtime_scale)
+            network->set_input_data("scale", scale);
+        if (runtime_zp)
+            network->set_input_data("zp", zp);
+        auto output = network->execute().at("fc").get_memory();
+        mem_lock<ov::float16, mem_lock_type::read> actual(output, get_test_stream());
+        ASSERT_EQ(actual.size(), size_t{2 * n});
+        for (int64_t row = 0; row < 2; ++row) {
+            for (int64_t oc = 0; oc < n; ++oc) {
+                float expected = 0.f;
+                for (int64_t ic = 0; ic < k; ++ic) {
+                    const auto g = ic / (k / groups);
+                    const auto zg = ic / (k / zp_groups);
+                    const auto s = 1 + 3 * oc + g + (runtime_scale ? iteration : 0);
+                    const auto z = 2 * oc + zg + (runtime_zp ? iteration : 0);
+                    const auto a = 1 + (row + ic) % 2;
+                    expected += static_cast<float>(a * (4 + oc + ic % 3 - z) * s);
+                }
+                EXPECT_FLOAT_EQ(static_cast<float>(actual[row * n + oc]), expected)
+                    << "iteration=" << iteration << " row=" << row << " oc=" << oc;
+            }
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(scale_zp_flags,
+                         fully_connected_runtime_decompression,
+                         testing::Combine(testing::Bool(), testing::Bool(), testing::Bool(), testing::Bool(),
+                                          testing::Bool(), testing::Bool(), testing::Bool()),
+                         fully_connected_runtime_decompression::getTestCaseName);
+
+class fully_connected_single_output_grouped_decompression
+    : public testing::TestWithParam<std::tuple<bool, bool, bool>> {
+public:
+    static std::string getTestCaseName(const testing::TestParamInfo<ParamType>& info) {
+        const auto& [with_zero_point, dynamic, cached] = info.param;
+        std::string name = with_zero_point ? "ScaleAndZeroPoint" : "ScaleOnly";
+        name += dynamic ? "_Dynamic" : "_Static";
+        name += cached ? "_Cached" : "_Fresh";
+        return name;
+    }
+};
+
+TEST_P(fully_connected_single_output_grouped_decompression, selects_optimized_onednn_gemm) {
+    const auto [with_zero_point, dynamic, cached] = GetParam();
+    auto& engine = get_test_engine();
+    if (!engine.get_device_info().supports_immad || !engine.get_device_info().supports_fp16)
+        GTEST_SKIP() << "Requires an Intel GPU with XMX and FP16 support.";
+
+    // N=1 is not OC broadcasting: clearing the OC mask bit selects reference matmul.
+    constexpr int64_t k = 2048;
+    constexpr int64_t groups = 16;
+    constexpr int64_t rows = 2;
+    auto input = engine.allocate_memory({ov::PartialShape{rows, k}, data_types::f16, format::bfyx});
+    auto weights = engine.allocate_memory({ov::PartialShape{1, k}, data_types::u4, format::bfyx});
+    auto scale = engine.allocate_memory({ov::PartialShape{1, groups}, data_types::f16, format::bfyx});
+    auto zp = engine.allocate_memory({ov::PartialShape{1, groups}, data_types::u8, format::bfyx});
+    set_values<ov::float16>(input, std::vector<ov::float16>(rows * k, ov::float16(1.f)));
+    set_values<uint8_t>(weights, std::vector<uint8_t>(k / 2, 0x33));
+    std::vector<ov::float16> scales(groups);
+    std::vector<uint8_t> zero_points(groups);
+    float expected = 0.f;
+    for (int64_t g = 0; g < groups; ++g) {
+        scales[g] = ov::float16(static_cast<float>(1 + g % 2));
+        zero_points[g] = static_cast<uint8_t>(g % 3);
+        expected += static_cast<float>((k / groups) * (3 - (with_zero_point ? zero_points[g] : 0)) * (1 + g % 2));
+    }
+    set_values<ov::float16>(scale, scales);
+    set_values<uint8_t>(zp, zero_points);
+    const auto input_shape = dynamic ? ov::PartialShape{-1, k} : ov::PartialShape{rows, k};
+    topology topology(input_layout("input", {input_shape, data_types::f16, format::bfyx}),
+                      data("weights", weights),
+                      input_layout("scale", scale->get_layout()));
+    if (with_zero_point)
+        topology.add(input_layout("zp", zp->get_layout()));
+    topology.add(fully_connected("fc", input_info("input"), "weights", "", "scale", with_zero_point ? "zp" : "",
+                                 data_types::f16, 2, 2, true, true, true));
+    auto config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    config.set_property(ov::intel_gpu::force_implementations(
+        ov::intel_gpu::ImplForcingMap{{"fc", {format::bfyx, "", impl_types::onednn}}}));
+    auto network = get_network(engine, topology, config, get_test_stream_ptr(), cached);
+    network->set_input_data("input", input);
+    network->set_input_data("scale", scale);
+    if (with_zero_point)
+        network->set_input_data("zp", zp);
+    auto output = network->execute().at("fc").get_memory();
+
+    auto* impl = network->get_primitive("fc")->get_impl();
+    ASSERT_NE(impl, nullptr);
+    ASSERT_TRUE(impl->is_onednn());
+    auto* onednn_impl = dynamic_cast<onednn::typed_primitive_onednn_impl<fully_connected>*>(impl);
+    ASSERT_NE(onednn_impl, nullptr);
+    // Inspect the actual descriptor, not the kernel name saved before cache reload.
+    const std::string implementation = onednn_impl->_pd.impl_info_str();
+    EXPECT_NE(implementation.find("gemm"), std::string::npos) << implementation;
+    EXPECT_EQ(implementation.find("ref"), std::string::npos) << implementation;
+    mem_lock<ov::float16, mem_lock_type::read> actual(output, get_test_stream());
+    ASSERT_EQ(actual.size(), static_cast<size_t>(rows));
+    for (int64_t row = 0; row < rows; ++row)
+        EXPECT_FLOAT_EQ(static_cast<float>(actual[row]), expected);
+}
+
+INSTANTIATE_TEST_SUITE_P(scale_zp_flags,
+                         fully_connected_single_output_grouped_decompression,
+                         testing::Combine(testing::Bool(), testing::Bool(), testing::Bool()),
+                         fully_connected_single_output_grouped_decompression::getTestCaseName);
+#endif
 
 TEST(fully_connected_gpu, dynamic_byxf) {
     auto& engine = get_test_engine();
