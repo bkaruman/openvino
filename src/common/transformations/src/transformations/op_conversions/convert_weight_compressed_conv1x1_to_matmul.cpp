@@ -203,9 +203,20 @@ ov::pass::ConvertWeightCompressedConv1x1ToMatmul::ConvertWeightCompressedConv1x1
             }
 
             auto source = node->output(0);
-            if (auto reshape = ov::as_type_ptr<ov::op::v1::Reshape>(node)) {
-                if (ov::shape_size(current_shape) == ov::shape_size(new_shape))
-                    source = reshape->input_value(0);
+            auto convert = ov::as_type_ptr<ov::op::v0::Convert>(node);
+            auto original_reshape = ov::as_type_ptr<ov::op::v1::Reshape>(
+                convert ? convert->get_input_node_shared_ptr(0) : node);
+            if (original_reshape) {
+                const auto& input_shape = original_reshape->get_input_partial_shape(0);
+                if (input_shape.is_static() && ov::shape_size(input_shape.to_shape()) == ov::shape_size(new_shape)) {
+                    source = original_reshape->input_value(0);
+                    if (convert) {
+                        auto simplified_convert = convert->clone_with_new_inputs({source});
+                        ov::copy_runtime_info(convert, simplified_convert);
+                        register_new_node(simplified_convert);
+                        source = simplified_convert->output(0);
+                    }
+                }
             }
             auto shape_const = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{new_shape.size()}, new_shape);
             auto reshape = std::make_shared<ov::op::v1::Reshape>(source, shape_const, false);

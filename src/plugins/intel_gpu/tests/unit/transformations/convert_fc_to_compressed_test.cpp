@@ -1243,7 +1243,12 @@ TEST_F(TransformationTestsF, ConvertFCToCompressed_DynamicZeroPointParameterNotC
     manager.register_pass<ConvertFullyConnectedToFullyConnectedCompressed>();
 }
 
-TEST_F(TransformationTestsF, ConvertFCToCompressed_Conv1x1RuntimeDecompressionChain) {
+class ConvertFCToCompressedConv1x1RuntimeInputs
+    : public TransformationTestsF,
+      public WithParamInterface<std::tuple<bool, bool>> {};
+
+TEST_P(ConvertFCToCompressedConv1x1RuntimeInputs, SimplifyMetadataWithoutChangingOtherConsumers) {
+    const auto [convert_before_reshape, shared_consumers] = GetParam();
     comparator.enable(FunctionsComparator::ATTRIBUTES);
     comparator.enable(FunctionsComparator::CONST_VALUES);
     auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::Shape{1, 1, 2, 16});
@@ -1254,7 +1259,11 @@ TEST_F(TransformationTestsF, ConvertFCToCompressed_Conv1x1RuntimeDecompressionCh
     auto activation = std::make_shared<ov::op::v1::Transpose>(input, input_order);
     auto shape_4d = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{4}, {4, 1, 1, 1});
     auto scale_convert = std::make_shared<ov::op::v0::Convert>(scale, ov::element::f16);
-    auto scale_4d = std::make_shared<ov::op::v1::Reshape>(scale_convert, shape_4d, false);
+    auto original_scale_reshape = std::make_shared<ov::op::v1::Reshape>(
+        convert_before_reshape ? scale_convert->output(0) : scale->output(0), shape_4d, false);
+    std::shared_ptr<ov::Node> scale_4d = original_scale_reshape;
+    if (!convert_before_reshape)
+        scale_4d = std::make_shared<ov::op::v0::Convert>(original_scale_reshape, ov::element::f16);
     auto zp_4d = std::make_shared<ov::op::v1::Reshape>(zp, shape_4d, false);
     auto zp_convert = std::make_shared<ov::op::v0::Convert>(zp_4d, ov::element::f16);
     auto weights = ov::op::v0::Constant::create(ov::element::u4, ov::Shape{4, 16, 1, 1}, {3});
@@ -1266,7 +1275,14 @@ TEST_F(TransformationTestsF, ConvertFCToCompressed_Conv1x1RuntimeDecompressionCh
                                                          ov::Strides{1, 1});
     auto output_order = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{4}, {0, 2, 3, 1});
     auto output = std::make_shared<ov::op::v1::Transpose>(conv, output_order);
-    model = std::make_shared<ov::Model>(ov::OutputVector{output}, parameters);
+    ov::OutputVector outputs{output};
+    if (shared_consumers) {
+        outputs.push_back(scale_4d);
+        if (!convert_before_reshape)
+            outputs.push_back(original_scale_reshape);
+        outputs.push_back(zp_4d);
+    }
+    model = std::make_shared<ov::Model>(outputs, parameters);
 
     auto shape_2d = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{2}, {4, 1});
     auto expected_scale = std::make_shared<ov::op::v1::Reshape>(scale_convert, shape_2d, false);
@@ -1275,11 +1291,16 @@ TEST_F(TransformationTestsF, ConvertFCToCompressed_Conv1x1RuntimeDecompressionCh
     auto no_bias = std::make_shared<ov::intel_gpu::op::Placeholder>();
     auto compressed = std::make_shared<ov::intel_gpu::op::FullyConnectedCompressed>(
         input, expected_weights, no_bias, expected_scale, expected_zp, ov::element::f16, true, true, true);
-    model_ref = std::make_shared<ov::Model>(ov::OutputVector{compressed}, parameters);
+    outputs[0] = compressed;
+    model_ref = std::make_shared<ov::Model>(outputs, parameters)->clone();
     manager.register_pass<ov::pass::ConvertWeightCompressedConv1x1ToMatmul>();
     manager.register_pass<ConvertMatMulToFullyConnected>(true);
     manager.register_pass<ConvertFullyConnectedToFullyConnectedCompressed>();
 }
+
+INSTANTIATE_TEST_SUITE_P(ConvertReshapeOrderingAndSharing,
+                         ConvertFCToCompressedConv1x1RuntimeInputs,
+                         Combine(Bool(), Bool()));
 
 TEST_F(TransformationTestsF, ConvertFCToCompressed_RuntimeScaleWithoutZeroPoint) {
     comparator.enable(FunctionsComparator::ATTRIBUTES);
