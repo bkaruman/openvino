@@ -245,10 +245,10 @@ std::shared_ptr<ov::Model> gen_model_ref(const Conv1x1ToMatmulTestParams& p) {
 
 class ConvertWeightCompressedConv1x1ToMatmulTest
     : public TransformationTestsF,
-      public WithParamInterface<std::tuple<bool, bool, bool, bool, bool, bool, bool, std::string>> {
+            public WithParamInterface<std::tuple<bool, bool, bool, bool, bool, bool, bool, std::string, bool, bool>> {
 public:
     static std::string get_test_case_name(
-        const testing::TestParamInfo<std::tuple<bool, bool, bool, bool, bool, bool, bool, std::string>>& obj) {
+                const testing::TestParamInfo<std::tuple<bool, bool, bool, bool, bool, bool, bool, std::string, bool, bool>>& obj) {
         const auto& [with_group_quant,
                      with_zp,
                      with_bias,
@@ -256,7 +256,9 @@ public:
                      with_param_weight,
                      with_act_new_reshape,
                      with_batched_input,
-                     activation_op_type] = obj.param;
+                     activation_op_type,
+                     with_param_scale,
+                     with_param_zp] = obj.param;
 
         std::ostringstream result;
         result << "with_group_quant=" << with_group_quant << "_";
@@ -266,7 +268,9 @@ public:
         result << "with_param_weight=" << with_param_weight << "_";
         result << "with_act_new_reshape=" << with_act_new_reshape << "_";
         result << "with_batched_input=" << with_batched_input << "_";
-        result << "activation_op_type=" << activation_op_type;
+        result << "activation_op_type=" << activation_op_type << "_";
+        result << "with_param_scale=" << with_param_scale << "_";
+        result << "with_param_zp=" << with_param_zp;
         return result.str();
     }
 
@@ -280,7 +284,9 @@ protected:
                      with_param_weight,
                      with_act_new_reshape,
                      with_batched_input,
-                     activation_op_type] = GetParam();
+                     activation_op_type,
+                     with_param_scale,
+                     with_param_zp] = GetParam();
         Conv1x1ToMatmulTestParams params{with_group_quant,
                                          with_zp,
                                          with_bias,
@@ -288,7 +294,9 @@ protected:
                                          with_param_weight,
                                          with_act_new_reshape,
                                          with_batched_input,
-                                         activation_op_type};
+                                         activation_op_type,
+                                         with_param_scale,
+                                         with_param_zp};
         model = gen_model(params);
         model_ref = (activation_op_type == "None") ? model->clone() : gen_model_ref(params);
         manager.register_pass<ov::pass::ConvertWeightCompressedConv1x1ToMatmul>();
@@ -312,17 +320,19 @@ INSTANTIATE_TEST_SUITE_P(TransformationTests,
                                                               "Reshape_None",
                                                               "None_Transpose",
                                                               "None_Reshape",
-                                                              "None")),
+                                                              "None"),
+                                            ::testing::Bool(),
+                                            ::testing::Bool()),
                          ConvertWeightCompressedConv1x1ToMatmulTest::get_test_case_name);
 
 class ConvertWeightCompressedConv1x1RuntimeInputs
     : public TransformationTestsF,
-      public WithParamInterface<std::tuple<bool, bool, bool, bool>> {
+            public WithParamInterface<std::tuple<bool, bool, bool, bool, bool>> {
 protected:
     void SetUp() override {
         TransformationTestsF::SetUp();
-        const auto [grouped, runtime_scale, runtime_zp, reshape_qparams] = GetParam();
-        Conv1x1ToMatmulTestParams params{grouped, true, false, false, true, false, false, "Transpose"};
+                const auto [grouped, runtime_weights, runtime_scale, runtime_zp, reshape_qparams] = GetParam();
+                Conv1x1ToMatmulTestParams params{grouped, true, false, false, runtime_weights, false, false, "Transpose"};
         params.with_param_scale = runtime_scale;
         params.with_param_zp = runtime_zp;
         params.reshape_qparams = reshape_qparams;
@@ -338,7 +348,7 @@ TEST_P(ConvertWeightCompressedConv1x1RuntimeInputs, ComposeDecompressionReshapes
 
 INSTANTIATE_TEST_SUITE_P(RuntimeDecompression,
                          ConvertWeightCompressedConv1x1RuntimeInputs,
-                         Combine(Bool(), Bool(), Bool(), Bool()));
+                         Combine(Bool(), Bool(), Bool(), Bool(), Bool()));
 
 // Checked blocked cases
 class ConvertWeightCompressedConv1x1ToMatmulTest_Blocked : public TransformationTestsF {

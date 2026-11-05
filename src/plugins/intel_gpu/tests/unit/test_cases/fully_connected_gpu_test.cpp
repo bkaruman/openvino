@@ -28,10 +28,11 @@ using namespace cldnn;
 using namespace ::tests;
 
 class fully_connected_runtime_decompression
-    : public testing::TestWithParam<std::tuple<bool, bool, bool, bool, bool, bool, bool>> {};
+    : public testing::TestWithParam<std::tuple<bool, bool, bool, bool, bool, bool, bool, bool>> {};
 
 TEST_P(fully_connected_runtime_decompression, independent_orientations_and_cache) {
-    const auto [weights_transposed, scale_transposed, zp_transposed, runtime_scale, runtime_zp, grouped_zp, cached] = GetParam();
+    const auto [weights_transposed, scale_transposed, zp_transposed, runtime_weights, runtime_scale, runtime_zp, grouped_zp, cached] =
+        GetParam();
     auto& engine = get_test_engine();
     if (!engine.get_device_info().supports_immad || !engine.get_device_info().supports_fp16)
         GTEST_SKIP() << "Requires an Intel GPU with XMX and FP16 support.";
@@ -72,7 +73,11 @@ TEST_P(fully_connected_runtime_decompression, independent_orientations_and_cache
             set_values<uint8_t>(zp, zero_points);
     };
     set_parameters(0);
-    topology topology(input_layout("input", input->get_layout()), data("weights", weights));
+    topology topology(input_layout("input", input->get_layout()));
+    if (runtime_weights)
+        topology.add(input_layout("weights", weights->get_layout()));
+    else
+        topology.add(data("weights", weights));
     if (runtime_scale)
         topology.add(input_layout("scale", scale->get_layout()));
     else
@@ -92,6 +97,14 @@ TEST_P(fully_connected_runtime_decompression, independent_orientations_and_cache
     network->set_input_data("input", input);
     for (int iteration = 0; iteration < 2; ++iteration) {
         set_parameters(iteration);
+        if (runtime_weights) {
+            if (iteration > 0) {
+                for (auto& value : weight_values)
+                    ++value;
+                set_values<uint8_t>(weights, weight_values);
+            }
+            network->set_input_data("weights", weights);
+        }
         if (runtime_scale)
             network->set_input_data("scale", scale);
         if (runtime_zp)
@@ -107,7 +120,8 @@ TEST_P(fully_connected_runtime_decompression, independent_orientations_and_cache
                     const auto zg = ic / (k / zp_groups);
                     const auto s = 1 + oc + g + (runtime_scale ? iteration : 0);
                     const auto z = oc + zg + (runtime_zp ? iteration : 0);
-                    expected += static_cast<float>((4 + oc + ic % 3 - z) * s);
+                    const auto weight_value = 4 + oc + ic % 3 + (runtime_weights ? iteration : 0);
+                    expected += static_cast<float>((weight_value - z) * s);
                 }
                 EXPECT_FLOAT_EQ(static_cast<float>(actual[row * n + oc]), expected)
                     << "iteration=" << iteration << " oc=" << oc;
@@ -119,7 +133,7 @@ TEST_P(fully_connected_runtime_decompression, independent_orientations_and_cache
 INSTANTIATE_TEST_SUITE_P(scale_zp_flags,
                          fully_connected_runtime_decompression,
                          testing::Combine(testing::Bool(), testing::Bool(), testing::Bool(), testing::Bool(),
-                                          testing::Bool(), testing::Bool(), testing::Bool()));
+                                          testing::Bool(), testing::Bool(), testing::Bool(), testing::Bool()));
 
 TEST(fully_connected_gpu, dynamic_byxf) {
     auto& engine = get_test_engine();
