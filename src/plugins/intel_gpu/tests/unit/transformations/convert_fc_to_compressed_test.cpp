@@ -8,6 +8,7 @@
 #include "openvino/pass/manager.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/convert.hpp"
+#include "openvino/op/matmul.hpp"
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/constant.hpp"
@@ -1383,6 +1384,65 @@ TEST_F(TransformationTestsF, ConvertFCToCompressed_RuntimeScaleWithoutZeroPoint)
     model_ref = std::make_shared<ov::Model>(ov::OutputVector{compressed}, ov::ParameterVector{input, scale});
     manager.register_pass<ConvertFullyConnectedToFullyConnectedCompressed>();
 }
+
+class ConvertFCToCompressedVectorScale : public TransformationTestsF,
+                                       public WithParamInterface<std::tuple<bool, bool>> {
+public:
+    static std::string getTestCaseName(const testing::TestParamInfo<ParamType>& info) {
+        const auto [runtime_weights, runtime_scale] = info.param;
+        return std::string(runtime_weights ? "ParameterWeights" : "ConstantWeights") +
+               (runtime_scale ? "_ParameterScale" : "_ConstantScale");
+    }
+
+protected:
+    void SetUp() override {
+        TransformationTestsF::SetUp();
+        const auto [runtime_weights, runtime_scale] = GetParam();
+        auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::Shape{2, 16});
+        ov::ParameterVector parameters{input};
+        std::shared_ptr<ov::Node> weights;
+        if (runtime_weights) {
+            auto parameter = std::make_shared<ov::op::v0::Parameter>(ov::element::u8, ov::Shape{16, 32});
+            parameters.push_back(parameter);
+            weights = parameter;
+        } else {
+            weights = ov::op::v0::Constant::create(ov::element::u8, ov::Shape{16, 32}, {3});
+        }
+        std::shared_ptr<ov::Node> scale;
+        if (runtime_scale) {
+            auto parameter = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::Shape{32});
+            parameters.push_back(parameter);
+            scale = parameter;
+        } else {
+            std::vector<float> values(32);
+            for (size_t index = 0; index < values.size(); ++index)
+                values[index] = static_cast<float>(index + 1) / 8.f;
+            scale = ov::op::v0::Constant::create(ov::element::f16, ov::Shape{32}, values);
+        }
+        auto convert = std::make_shared<ov::op::v0::Convert>(weights, ov::element::f16);
+        auto multiply = std::make_shared<ov::op::v1::Multiply>(convert, scale);
+        auto matmul = std::make_shared<ov::op::v0::MatMul>(input, multiply, false, false);
+        model = std::make_shared<ov::Model>(ov::OutputVector{matmul}, parameters);
+
+        auto order = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{2}, {1, 0});
+        auto transposed_weights = std::make_shared<ov::op::v1::Transpose>(weights, order);
+        auto no_bias = std::make_shared<ov::intel_gpu::op::Placeholder>();
+        auto compressed = std::make_shared<ov::intel_gpu::op::FullyConnectedCompressed>(
+            input, transposed_weights, no_bias, scale, ov::element::f16, true, false, false);
+        model_ref = std::make_shared<ov::Model>(ov::OutputVector{compressed}, parameters);
+        comparator.enable(FunctionsComparator::ATTRIBUTES);
+        comparator.enable(FunctionsComparator::CONST_VALUES);
+        manager.register_pass<ConvertMatMulToFullyConnected>(true);
+        manager.register_pass<ConvertFullyConnectedToFullyConnectedCompressed>();
+    }
+};
+
+TEST_P(ConvertFCToCompressedVectorScale, PreserveVectorScaleThroughMatMulConversion) {}
+
+INSTANTIATE_TEST_SUITE_P(WeightRankNormalization,
+                         ConvertFCToCompressedVectorScale,
+                         Combine(Bool(), Bool()),
+                         ConvertFCToCompressedVectorScale::getTestCaseName);
 
 class ConvertFCToCompressedScalarScale : public TransformationTestsF,
                                        public WithParamInterface<std::tuple<bool, bool, int>> {
