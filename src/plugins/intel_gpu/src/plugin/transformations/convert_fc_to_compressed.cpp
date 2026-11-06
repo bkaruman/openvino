@@ -126,8 +126,23 @@ ConvertFullyConnectedToFullyConnectedCompressed::ConvertFullyConnectedToFullyCon
 
         auto convert_zp_const = [&](std::shared_ptr<ov::Node> node) {
             auto source = node;
-            while (ov::is_type<ov::op::v1::Reshape>(source) || ov::is_type<ov::op::v0::Convert>(source)) {
+            while (ov::is_type<ov::op::v1::Reshape>(source)) {
                 source = source->get_input_node_shared_ptr(0);
+            }
+            if (ov::is_type<ov::op::v0::Convert>(source) &&
+                (source->get_element_type() == ov::element::f16 ||
+                 source->get_element_type() == ov::element::f32 ||
+                 source->get_element_type() == ov::element::f64)) {
+                auto input = source->get_input_node_shared_ptr(0);
+                while (ov::is_type<ov::op::v1::Reshape>(input)) {
+                    input = input->get_input_node_shared_ptr(0);
+                }
+                if (input->get_element_type() == ov::element::u8 ||
+                    input->get_element_type() == ov::element::u4 ||
+                    input->get_element_type() == ov::element::u3 ||
+                    input->get_element_type() == ov::element::u2) {
+                    source = input;
+                }
             }
             std::shared_ptr<ov::Node> result = nullptr;
             // Convert ZP to u8 (or i8 for a scalar i4 ZP)

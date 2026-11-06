@@ -1403,6 +1403,48 @@ TEST_F(TransformationTestsF, ConvertFCToCompressed_RuntimeSignedScalarZeroPoint)
     manager.register_pass<ConvertFullyConnectedToFullyConnectedCompressed>();
 }
 
+class ConvertFCToCompressedSignedRuntimeZeroPoint : public TransformationTestsF,
+                                                  public WithParamInterface<bool> {
+public:
+    static std::string getTestCaseName(const testing::TestParamInfo<bool>& info) {
+        return info.param ? "U4ToI4ZeroPoint" : "U8ToI8ZeroPoint";
+    }
+
+protected:
+    void SetUp() override {
+        TransformationTestsF::SetUp();
+        comparator.enable(FunctionsComparator::ATTRIBUTES);
+        comparator.enable(FunctionsComparator::CONST_VALUES);
+        const auto source_type = GetParam() ? ov::element::u4 : ov::element::u8;
+        const auto signed_type = GetParam() ? ov::element::i4 : ov::element::i8;
+        auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::Shape{1, 16});
+        auto zp = std::make_shared<ov::op::v0::Parameter>(source_type, ov::Shape{32});
+        auto signed_zp = std::make_shared<ov::op::v0::Convert>(zp, signed_type);
+        auto shape = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, {32, 1});
+        auto reshaped_zp = std::make_shared<ov::op::v1::Reshape>(signed_zp, shape, false);
+        auto zp_float = std::make_shared<ov::op::v0::Convert>(reshaped_zp, ov::element::f16);
+        auto weights = ov::op::v0::Constant::create(ov::element::u8, ov::Shape{32, 16}, {3});
+        auto weights_float = std::make_shared<ov::op::v0::Convert>(weights, ov::element::f16);
+        auto subtract = std::make_shared<ov::op::v1::Subtract>(weights_float, zp_float);
+        auto scale = ov::op::v0::Constant::create(ov::element::f16, ov::Shape{32, 1}, {1});
+        auto multiply = std::make_shared<ov::op::v1::Multiply>(subtract, scale);
+        auto no_bias = std::make_shared<ov::intel_gpu::op::Placeholder>();
+        auto fc = std::make_shared<ov::intel_gpu::op::FullyConnected>(input, multiply, no_bias);
+        model = std::make_shared<ov::Model>(ov::OutputVector{fc}, ov::ParameterVector{input, zp});
+        auto compressed = std::make_shared<ov::intel_gpu::op::FullyConnectedCompressed>(
+            input, weights, no_bias, scale, reshaped_zp);
+        model_ref = std::make_shared<ov::Model>(ov::OutputVector{compressed}, ov::ParameterVector{input, zp});
+        manager.register_pass<ConvertFullyConnectedToFullyConnectedCompressed>();
+    }
+};
+
+TEST_P(ConvertFCToCompressedSignedRuntimeZeroPoint, PreserveSignedConversion) {}
+
+INSTANTIATE_TEST_SUITE_P(RuntimeDecompression,
+                         ConvertFCToCompressedSignedRuntimeZeroPoint,
+                         Bool(),
+                         ConvertFCToCompressedSignedRuntimeZeroPoint::getTestCaseName);
+
 }  // namespace intel_gpu
 }  // namespace test
 }  // namespace ov
