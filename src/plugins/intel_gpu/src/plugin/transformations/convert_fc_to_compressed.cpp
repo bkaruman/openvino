@@ -181,7 +181,8 @@ ConvertFullyConnectedToFullyConnectedCompressed::ConvertFullyConnectedToFullyCon
         }
 
         const size_t compressed_weight_rank = is_weight_3d ? 3 : 2;
-        if (!weights_are_constant && fc_input_b->get_output_partial_shape(0).size() != compressed_weight_rank) {
+        if (!weights_are_constant && !has_transpose_before_reshape &&
+            fc_input_b->get_output_partial_shape(0).size() != compressed_weight_rank) {
             ov::Shape weight_shape_final(compressed_weight_rank, 1);
             for (size_t i = weight_shape.size() - 1, idx = compressed_weight_rank - 1;; --i) {
                 if (weight_shape[i] > 1) {
